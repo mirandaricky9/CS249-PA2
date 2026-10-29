@@ -332,8 +332,17 @@ class Peer:
 
         try:
             for line in reader:
-                reply = self.handle_peer_message(line)
+                try:
+                    msg = json.loads(line)
+                except ValueError:
+                    raise BAD_REQUEST("Peer message is not valid JSON.")
+                if not isinstance(msg, dict):
+                    raise BAD_REQUEST("Peer message must be a JSON object.")
+
+                reply = self.handle_peer_message(msg)
                 send_line(conn, reply)
+        except TypeError:
+            raise BAD_REQUEST()
         finally:
             reader.close()
             conn.close()
