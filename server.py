@@ -310,7 +310,6 @@ class Peer:
     # methods will be defined later 
     def handle_peer_message(self, msg):
         message_type = msg["type"]
-        request_id = msg["request_id"]
 
         if message_type == "PING":
             return "PONG", msg["sequence"]
@@ -323,8 +322,10 @@ class Peer:
 
         elif message_type == "LEADER_ANNOUNCE":
             return self.update_leader(msg)
+        elif message_type == "USER_ADD":
+            return
         else:
-            return SERVER_ERROR
+            raise SERVER_ERROR
 
     def handle_peer_connection(self, conn, addr):
         reader = conn.makefile(mode="r", encoding="utf-8", errors="replace")
@@ -1059,7 +1060,7 @@ def main():
     server_peer_port = server["peer_port"]
 
     store = Store(list(all_channels))
-    peers = Peer(server, store, config)
+    peer = Peer(server_id, store, config)
     
     # Creating the HTTP thread
     httpd = MiniDiscordServer((server_host, server_http_port), MiniDiscordHandler, store)
@@ -1070,7 +1071,7 @@ def main():
 
     # Creating the TCP server
     try:
-        start_tcp_server(server_host, server_peer_port, store)
+        peer.start_listener(server_host, server_peer_port)
     except KeyboardInterrupt:
         print("Shutting down TCP server")
         # At this point, the daemon should die with the server but add finally for good measure
