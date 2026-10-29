@@ -323,7 +323,7 @@ class Peer:
         elif message_type == "LEADER_ANNOUNCE":
             return self.update_leader(msg)
         elif message_type == "USER_ADD":
-            return
+            return self.add_user(msg)
         else:
             raise SERVER_ERROR
 
@@ -369,6 +369,9 @@ class Peer:
         pass
 
     def update_leader(self, msg):
+        pass
+
+    def add_user(self, msg):
         pass
 
     def get_id(self):
