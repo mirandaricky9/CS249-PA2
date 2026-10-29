@@ -44,7 +44,6 @@ class Store:
                 raise INVALID_USERNAME(
                     "Username is invalid. Only letters, numbers, underscores, and hyphens are allowed. Please try again."
                 )
-
     def post_message(self, channel, user, text):
         with self.lock:
             if self.regex_channel.search(channel):
@@ -264,7 +263,7 @@ class Peer:
         self.misses = {sid: 0 for sid in self.peer_ids}
         
         self.current_leader = None
-        self.state_lock = threading.RLock
+        self.state_lock = threading.RLock()
 
 
     def peer_call(self, target_id, obj, timeout=2) -> dict:
@@ -281,8 +280,30 @@ class Peer:
             raise SERVICE_UNAVAILABLE
         finally:
             sock.close()
-
     
+    # Similar to start_tcp_server but listening for peers instead
+    def start_listener(self, host, port):
+         # AF_INET for IPV4
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        # REUSEADDR for reusing the same address when testing
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind((host, port))
+        # backlog
+        sock.listen(10)
+
+        print(f"[{self.id}] Peer listener on {host}:{port}")
+
+        try:
+            while True:
+                conn, addr = sock.accept()
+                peer_thread = threading.Thread(
+                    target=self.handle_peer_connection,
+                    args=(conn, addr),
+                    daemon=True,
+                )
+                peer_thread.start()
+        finally:
+            sock.close()
 
     # PEER LISTENER SECTION
     # Heartbeat messages
@@ -305,6 +326,17 @@ class Peer:
         else:
             return SERVER_ERROR
 
+    def handle_peer_connection(self, conn, addr):
+        reader = conn.makefile(mode="r", encoding="utf-8", errors="replace")
+
+        try:
+            for line in reader:
+                reply = self.handle_peer_message(line)
+                send_line(conn, reply)
+        finally:
+            reader.close()
+            conn.close()
+            
     # Heartbeats
     # Send a ping to each peer every 2 seconds
     # Wait up to two seconds for a matching PONG
@@ -1025,9 +1057,9 @@ def main():
     server_host = server["host"]
     server_http_port = server["http_port"]
     server_peer_port = server["peer_port"]
-    server_priority = server["priority"]
 
     store = Store(list(all_channels))
+    peers = Peer(server, store, config)
     
     # Creating the HTTP thread
     httpd = MiniDiscordServer((server_host, server_http_port), MiniDiscordHandler, store)
