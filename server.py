@@ -249,6 +249,14 @@ class Store:
 
 # A class to keep track of other peers 
 class Peer:
+    # Defining constants for heartbeat detection which are:
+    # time between PINGs
+    # time to wait for a PONG
+    # num of consecutive misses
+    HEARTBEAT_INTERVAL = 2
+    HEARTBEAT_TIMEOUT  = 2
+    MISS_THRESHOLD     = 3 
+
     def __init__(self, server_id, store, cluster_config):
         self.id = server_id
         self.cluster_config = cluster_config
@@ -266,19 +274,30 @@ class Peer:
         self.state_lock = threading.RLock()
 
 
-    def peer_call(self, target_id, obj, timeout=2) -> dict:
+    def peer_call(self, host, peer_port, obj, timeout=2) -> dict:
 
-        sock = socket.create_connection(target_id, timeout)
-
+        try: 
+            sock = socket.create_connection((host, peer_port), timeout)
+            
+            
+        except OSError:
+            raise SERVICE_UNAVAILABLE(f"Peer at {host}:{peer_port} is unreachable")
+        
+        reader = sock.makefile(mode="r", encoding="utf-8", errors="replace")
         try:
             text = json.dumps(obj) + "\n"
             sock.sendall(text.encode("utf-8"))
-            reader = sock.makefile(mode="r", encoding="utf-8", errors="replace")
-            line = reader.readline()
-            return json.loads(line)
+            
+            raw = reader.readline()
+            line = json.loads(raw)
+            if not isinstance(line, dict):
+                raise SERVICE_UNAVAILABLE("Reply is not in the form of a dictionary.")
+
+            return line
         except (TimeoutError, OSError, ValueError):
-            raise SERVICE_UNAVAILABLE
+            raise SERVICE_UNAVAILABLE(f"{host}:{peer_port} is experiencing issues processing.")
         finally:
+            reader.close()
             sock.close()
     
     # Similar to start_tcp_server but listening for peers instead
@@ -312,7 +331,9 @@ class Peer:
         message_type = msg["type"]
 
         if message_type == "PING":
-            return "PONG", msg["sequence"]
+            return {"type": "PONG",
+                    "from": self.id,
+                    "sequence": msg["sequence"]}
         
         elif message_type == "FORWARD":
             return self.do_local_operation(msg)
@@ -341,35 +362,101 @@ class Peer:
 
                 reply = self.handle_peer_message(msg)
                 send_line(conn, reply)
-        except TypeError:
-            raise BAD_REQUEST()
+        except ERROR as e:
+            send_line(conn, e.to_dict())
+        except Exception:
+            traceback.print_exc()
+            send_line(conn, SERVER_ERROR().to_dict())
         finally:
             reader.close()
             conn.close()
-            
-    # Heartbeats
-    # Send a ping to each peer every 2 seconds
-    # Wait up to two seconds for a matching PONG
-    # count missing or timed-out repsonse as one missed heartbeat
-    # mark a peer unavailable after 3 consecutive missed heartbeats
-    # reset mssed-response counter after successful heartbeat
-    # keep monitoring health peers after another peer fails 
 
-    # likely this method needs to be moved inside a class to get self.id
-
+    # heartbeat loop for the other peers
     def heartbeat_loop(self, peer):
+        # grab peer information from the cluster config 
+        peer_info = self.cluster_config["servers"][peer]
+        host = peer_info["host"]
+        port = peer_info["peer_port"]
+        # var to track the number of sequences that occur
         seq = 0
         while True:
             seq += 1
+            # initialize boolean 
+            peer_ok = False
             try:
-                resp = self.peer_call(peer, {"type": "PING", "from": self.id, "sequence": seq})
-                if resp["type"] == "PONG" and resp["sequence"] == seq:
+                resp = self.peer_call(host, port, {"type": "PING", "from": self.id, "sequence": seq}, self.HEARTBEAT_TIMEOUT)
+                if resp.get("type") == "PONG" and resp.get("sequence") == seq:
+                    peer_ok = True
+            except SERVICE_UNAVAILABLE:
+                peer_ok = False
+
+            with self.state_lock:
+                # variable for logging purposes
+                was_alive = self.alive[peer]
+                if peer_ok:
                     self.misses[peer] = 0
-                    self.alive[peer] = True
-            finally:
-                print("test")
+                    self.alive[peer]  = True
+
+                else:
+                    self.misses[peer] += 1
+                    if self.misses[peer] >= self.MISS_THRESHOLD:
+                        self.alive[peer] = False
+
+                # variable for logging purposes
+                now_alive = self.alive[peer]
+
+            # if was_alive is True and now_alive is False, then the peer died
+            if was_alive and not now_alive:
+                print(f"[{self.id}] Peer {peer} marked UNAVAILABLE after {self.MISS_THRESHOLD} missed heartbeats")
+            # if was_alive is False and now_alive is True, then peer revived
+            elif not was_alive and now_alive:
+                print(f"[{self.id}] Peer {peer} is AVAILABLE again.")
+
+            # time to wait between heartbeat pings
+            time.sleep(self.HEARTBEAT_INTERVAL)
+            
+
         
-    
+
+    # Sending a message to all targets (peers in this case)
+    # return the peers' replies
+    def broadcast(self, obj, targets, timeout=2):
+        results = {}
+        results_lock = threading.RLock()
+
+        def send_to(peer_id):
+            peer_info = self.cluster_config["servers"][peer_id]
+            host = peer_info["host"]
+            port = peer_info["peer_port"]
+
+            try:
+                reply = self.peer_call(host, port, obj, timeout)
+            except SERVICE_UNAVAILABLE as e:
+                reply = e
+
+            with results_lock:
+                results[peer_id] = reply
+
+        threads = []
+        for peer_id in targets:
+            t = threading.Thread(target=send_to, args=(peer_id,), daemon=True)
+            t.start()
+            threads.append(t)
+
+        for t in threads:
+            t.join(timeout + 1)
+
+        return results
+
+
+    def alive_peers(self):
+        with self.state_lock:
+            result = []
+            for peer_id, is_alive in self.alive.items():
+                if is_alive:
+                    result.append(peer_id)
+
+            return result
 
     def do_local_operation(self, msg, **fields):
         pass
@@ -736,197 +823,10 @@ class MiniDiscordHandler(http.server.BaseHTTPRequestHandler):
         print(format % args)
 
 
-# Function to start the TCP server
-def start_tcp_server(host, port, store):
-    # AF_INET for IPV4
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    # REUSEADDR for reusing the same address when testing
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind((host, port))
-    # backlog
-    sock.listen(10)
-
-    print(f"TCP listening on {host}:{port}")
-
-    try:
-        while True:
-            conn, addr = sock.accept()
-            print(f"New client has joined from {addr}")
-            
-            tcp_thread = threading.Thread(target=handle_tcp_client, args=(conn, addr, store), daemon=True)
-            tcp_thread.start()
-    finally:
-        sock.close()
-
-def handle_tcp_client(conn, addr, store):
-    user = None
-    should_close = False
-    reader = conn.makefile(mode="r", encoding="utf-8", errors="replace")
-    
-    try:
-        for line in reader:
-            response, should_close, user = process_line(line, user, store)
-            send_line(conn, response)
-            if should_close:
-                break
-
-    except OSError as e:
-        print(e, addr)
-
-    finally:
-        try: 
-            if should_close:
-                print(f"Client {addr} quit cleanly.")
-            else:
-                print(f"Client {addr} disconnected unexpectedly (User: {user})")
-            if user is not None:
-                 store.remove_user_from_channels(user)
-        finally:
-            reader.close()
-            conn.close()
-
-def process_line(line, user, store):
-    try:
-        line = line.strip()
-        if line == "":
-            raise BAD_REQUEST("Empty command. No line to process")
-
-        tokens = line.split(maxsplit=2)
-
-        cmd = tokens[0].upper()
-
-        if cmd == "REGISTER":    return tcp_register(tokens, user, store)
-        elif cmd == "LOGIN":     return tcp_login(tokens, user, store)
-        elif cmd == "JOIN":      return tcp_join(tokens, user, store)
-        elif cmd == "LEAVE":     return tcp_leave(tokens, user, store)
-        elif cmd == "SEND":      return tcp_send(tokens, user, store)
-        elif cmd == "LIST":      return tcp_list(tokens, user, store)
-        elif cmd == "HISTORY":   return tcp_history(tokens, user, store)
-        elif cmd == "LOGOUT":    return tcp_logout(tokens, user, store)
-        elif cmd == "QUIT":      return tcp_quit(tokens, user, store)
-        else:
-            raise BAD_REQUEST(f"Unknown command: {cmd}")
-
-    except ERROR as e:
-        return e.to_dict(), False, user
-
-    except Exception:
-        traceback.print_exc()
-        return SERVER_ERROR().to_dict(), False, user
-
 
 def send_line(conn, obj):
     text = json.dumps(obj, separators=(",", ":")) + "\n"
     conn.sendall(text.encode("utf-8"))
-    
-# helper methods of process_line for TCP part
-def require_login(user):
-    if user is None:
-        raise NOT_AUTHENTICATED("Not logged in. Use LOGIN <username> first to log in.")
-    return user
-
-# number of tokens for tcp command
-# allowed_counts is a set() which is for LIST and HISTORY commands, which can take 2 or 3 tokens
-def require_args(tokens, allowed_counts, usage):
-    if len(tokens) not in allowed_counts:
-        raise BAD_REQUEST("Usage: " + usage)
-
-
-def tcp_register(tokens, user, store):
-    require_args(tokens, {2}, "REGISTER <username>")
-    store.register_user(tokens[1])
-    return {"status": "ok",
-                        "operation": "register",
-                        "username": tokens[1]}, False, user
-
-def tcp_login(tokens, user, store):
-    require_args(tokens, {2}, "LOGIN <username>")
-    if not store.is_user(tokens[1]):
-        raise NOT_FOUND("User is not found. Please register if needed or try again.")
-
-    return {"status": "ok",
-                "operation": "login",
-                "username": tokens[1]}, False, tokens[1]
-
-
-def tcp_join(tokens, user, store):
-    require_args(tokens, {2}, "JOIN <channel>")
-    name = require_login(user)
-    store.join(name, tokens[1])
-    return {"status": "ok",
-                        "operation": "join",
-                        "channel": tokens[1],
-                        "username": name}, False, user
-
-def tcp_leave(tokens, user, store):
-    require_args(tokens, {2}, "LEAVE <channel>")
-    name = require_login(user)
-    store.leave(name, tokens[1])
-    return {"status": "ok",
-                            "operation": "leave",
-                            "channel": tokens[1],
-                            "username": name}, False, user
-
-def tcp_send(tokens, user, store):
-    require_args(tokens, {3}, "SEND <channel> <text>")
-    name = require_login(user)
-    message = store.post_message(tokens[1], name, tokens[2])
-
-    return {"status": "ok",
-            "operation": "send",
-            "message_id": message.get_id()}, False, user
-
-def tcp_list(tokens, user, store):
-    require_args(tokens, {2, 3}, "LIST CHANNELS | LIST USERS <channel>")
-    subcmd = tokens[1].upper()
-
-    if subcmd == "CHANNELS" and len(tokens) == 2:
-        channels = store.get_channels()
-        return {"status": "ok",
-                    "operation": "list_channels",
-                    "channels": channels}, False, user
-    elif subcmd == "USERS" and len(tokens) == 3:
-        users = store.get_users_of_channel(tokens[2])
-        return {"status": "ok",
-                            "operation": "list_users",
-                            "channel": tokens[2],
-                            "users": users}, False, user
-    else:
-        raise BAD_REQUEST("Bad request. Please try again with proper format.")
-
-def tcp_history(tokens, user, store):
-    require_args(tokens, {2,3}, "HISTORY <channel> [limit]")
-
-    if len(tokens) == 2:
-        # default limit
-        history = store.get_channel_history(tokens[1])
-        return {"status": "ok",
-                                "operation": "history",
-                                "channel": tokens[1],
-                                "messages": history}, False, user
-    elif len(tokens) == 3:
-        try: 
-            limit = int(tokens[2])
-            history = store.get_channel_history(tokens[1], limit)
-            return {"status": "ok",
-                    "operation": "history",
-                    "channel": tokens[1],
-                    "messages": history}, False, user
-        except ValueError:
-            raise BAD_REQUEST("Limit is not an integer.")
-
-def tcp_logout(tokens, user, store):
-    require_args(tokens, {1}, "LOGOUT")
-    name = require_login(user)
-    store.remove_user_from_channels(name)
-    return {"status": "ok",
-            "operation": "logout",
-            "username": name}, False, None
-    
-def tcp_quit(tokens, user, store):
-    require_args(tokens, {1}, "QUIT")
-    return {"status": "ok",
-            "operation": "quit"}, True, user
 
 # defining a helper method for passing failures
 def fail(message) -> NoReturn:
@@ -1081,12 +981,16 @@ def main():
     http_thread.start()
     print(f"HTTP Thread started on {server_host}:{server_http_port}")
 
-    # Creating the TCP server
+    # starting threads for each heartbeat
+    for peer_id in peer.peer_ids:
+        heartbeat_thread = threading.Thread(target=peer.heartbeat_loop, args=(peer_id,), daemon=True)
+        heartbeat_thread.start()
+    print(f"Heartbeat threads started for {peer.peer_ids}")
+    
     try:
         peer.start_listener(server_host, server_peer_port)
     except KeyboardInterrupt:
-        print("Shutting down TCP server")
-        # At this point, the daemon should die with the server but add finally for good measure
+        print("Shutting down peer listener")
     finally:
         httpd.server_close()
 
