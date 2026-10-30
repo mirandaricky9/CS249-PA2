@@ -690,7 +690,7 @@ class MiniDiscordHandler(http.server.BaseHTTPRequestHandler):
             if length == 2:
                 if segments[1] == "health":
                     self._send_json(200, {"status": "ok",
-                                          "server": self.server.peer.id})
+                                          "server_id": self.server.peer.id})
                 
                 elif segments[1] == "servers":
                     self._send_json(200, {"servers": self.server.peer.server_status()})
@@ -838,7 +838,7 @@ class MiniDiscordHandler(http.server.BaseHTTPRequestHandler):
     
     # Return None, simply print
     def log_message(self, format, *args):
-        print(f"[{self.server.peer_id}]" + (format % args))
+        print(f"[{self.server.peer.id}] " + (format % args))
 
 
 
