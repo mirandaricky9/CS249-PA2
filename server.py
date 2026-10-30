@@ -448,6 +448,18 @@ class Peer:
 
         return results
 
+    # the server status of all processes/servers in the cluster
+    def server_status(self):
+        with self.state_lock:
+            rows = []
+            for server_id in self.cluster_config["servers"]:
+                if server_id == self.id:
+                    alive = True
+                else:
+                    alive = self.alive[server_id]
+                rows.append({"server_id": server_id, "alive": alive})
+                return rows
+
 
     def alive_peers(self):
         with self.state_lock:
@@ -591,12 +603,13 @@ def code_lookup(code):
 
 
 # Class to define the DiscordServer
-# Creating a threading HTTPServer that takes Store as an input
+# Creating a threading HTTPServer that takes Store and Peer as inputs
 # inherits everything else
 class MiniDiscordServer(http.server.ThreadingHTTPServer):
-    def __init__(self, server_address, RequestHandlerClass, store: Store):
+    def __init__(self, server_address, RequestHandlerClass, store: Store, peer: Peer ):
         super().__init__(server_address, RequestHandlerClass)
         self.store = store
+        self.peer = peer
 
 
 class MiniDiscordHandler(http.server.BaseHTTPRequestHandler):
@@ -676,7 +689,11 @@ class MiniDiscordHandler(http.server.BaseHTTPRequestHandler):
             length = len(segments)
             if length == 2:
                 if segments[1] == "health":
-                    self._send_json(200, {"status": "ok"})
+                    self._send_json(200, {"status": "ok",
+                                          "server": self.server.peer.id})
+                
+                elif segments[1] == "servers":
+                    self._send_json(200, {"servers": self.server.peer.server_status()})
 
                 elif segments[1] == "users":
                     self._send_json(200, {"users": store.get_users()})
@@ -818,9 +835,10 @@ class MiniDiscordHandler(http.server.BaseHTTPRequestHandler):
         except Exception:
             traceback.print_exc()
             self._send_json(500, SERVER_ERROR().to_dict())
+    
     # Return None, simply print
     def log_message(self, format, *args):
-        print(format % args)
+        print(f"[{self.server.peer_id}]" + (format % args))
 
 
 
@@ -975,22 +993,22 @@ def main():
     peer = Peer(server_id, store, config)
     
     # Creating the HTTP thread
-    httpd = MiniDiscordServer((server_host, server_http_port), MiniDiscordHandler, store)
+    httpd = MiniDiscordServer((server_host, server_http_port), MiniDiscordHandler, store, peer)
 
     http_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     http_thread.start()
-    print(f"HTTP Thread started on {server_host}:{server_http_port}")
+    print(f"[{server_id}] HTTP Thread started on {server_host}:{server_http_port}")
 
     # starting threads for each heartbeat
     for peer_id in peer.peer_ids:
         heartbeat_thread = threading.Thread(target=peer.heartbeat_loop, args=(peer_id,), daemon=True)
         heartbeat_thread.start()
-    print(f"Heartbeat threads started for {peer.peer_ids}")
+    print(f"[{server_id}] Heartbeat threads started for {peer.peer_ids}")
     
     try:
         peer.start_listener(server_host, server_peer_port)
     except KeyboardInterrupt:
-        print("Shutting down peer listener")
+        print(f"[{server_id}]Shutting down peer listener")
     finally:
         httpd.server_close()
 
