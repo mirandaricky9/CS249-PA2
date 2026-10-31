@@ -458,7 +458,7 @@ class Peer:
                 else:
                     alive = self.alive[server_id]
                 rows.append({"server_id": server_id, "alive": alive})
-                return rows
+            return rows
 
 
     def alive_peers(self):
@@ -941,6 +941,21 @@ def validate_config(config):
         if ports[0] == ports[1]:
             fail(id + ": http port and peer port are matching.")
 
+    # checking to see if ports and priorities are unique across
+    # all servers
+    all_ports = []
+    priorities = []
+
+    for key in servers.values():
+        all_ports.extend([key["http_port"], key["peer_port"]])
+        priorities.append(key["priority"])
+
+    # Using a set() will remove duplicates
+    if len(set(all_ports)) != len(all_ports):
+        fail("Two servers share a port. Every http and peer port must be unique.")
+
+    if len(set(priorities)) != len(priorities):
+        fail("Two servers share the same priority. They must be unique.")
 
     # if there are no channels
     if len(channels) == 0:
@@ -964,9 +979,6 @@ def validate_config(config):
         if primary == backup:
             fail(channel + ": primary and backup are both " + primary)
     
-
-
-
 
 
 def main():
@@ -1008,7 +1020,7 @@ def main():
     try:
         peer.start_listener(server_host, server_peer_port)
     except KeyboardInterrupt:
-        print(f"[{server_id}]Shutting down peer listener")
+        print(f"[{server_id}] Shutting down peer listener")
     finally:
         httpd.server_close()
 
