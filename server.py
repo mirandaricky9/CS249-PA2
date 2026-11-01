@@ -9,6 +9,7 @@ import traceback
 import urllib.parse
 import sys
 from typing import NoReturn
+import uuid
 
 def eprint(*args, **kwargs):
     print(*args, file=sys.stderr, **kwargs)
@@ -247,6 +248,13 @@ class Store:
 
             return history
 
+    def add_user(self, name):
+        with self.lock:
+            if name not in self.users:
+                self.users[name] = time.time()
+
+            
+
 # A class to keep track of other peers 
 class Peer:
     # Defining constants for heartbeat detection which are:
@@ -269,9 +277,13 @@ class Peer:
         self.alive = {sid: True for sid in self.peer_ids}
         # assume all peers have no misses
         self.misses = {sid: 0 for sid in self.peer_ids}
-        
-        self.current_leader = None
         self.state_lock = threading.RLock()
+        servers = cluster_config["servers"]
+        self.user_owner = min(servers, key=lambda server_id: servers[server_id]["priority"])
+        self.current_leader = self.compute_leader()
+        self.regex_channel = re.compile("^#[A-Za-z0-9_-]+$")
+
+        
 
 
     def peer_call(self, host, peer_port, obj, timeout=2) -> dict:
@@ -336,7 +348,7 @@ class Peer:
                     "sequence": msg["sequence"]}
         
         elif message_type == "FORWARD":
-            return self.do_local_operation(msg)
+            return self.handle_forward(msg)
 
         elif message_type == "REPLICATE":
             return self.store_replica(msg)
@@ -412,12 +424,13 @@ class Peer:
             elif not was_alive and now_alive:
                 print(f"[{self.id}] Peer {peer} is AVAILABLE again.")
 
+            # if statuses have changed, the leader may have changed as well
+            if was_alive != now_alive:
+                self.recompute_leader()
+
             # time to wait between heartbeat pings
             time.sleep(self.HEARTBEAT_INTERVAL)
             
-
-        
-
     # Sending a message to all targets (peers in this case)
     # return the peers' replies
     def broadcast(self, obj, targets, timeout=2):
@@ -470,20 +483,240 @@ class Peer:
 
             return result
 
-    def do_local_operation(self, msg, **fields):
-        pass
+    def do_local_operation(self, operation, fields):
+        store = self.store
+        if operation == "REGISTER_USER":
+            if self.id != self.user_owner:
+                raise SERVER_ERROR(f"{self.id} is not the user owner.")
+            username = fields.get("username")
+            store.register_user(username)
 
-    def store_replica(self, msg):
-        pass
+            targets = self.alive_peers()
+            self.broadcast({"type": "USER_ADD",
+                            "from": self.id,
+                            "username": username}, targets)
+            return {"username": username}
 
-    def update_leader(self, msg):
-        pass
+        channel = fields["channel"]
+
+        if operation == "JOIN":
+            store.join(fields["username"], channel)
+            return {"channel": channel, "username": fields["username"], "joined": True}
+
+        if operation == "LEAVE":
+            store.leave(fields["username"], channel)
+            return {"channel": channel, "username": fields["username"], "left": True}
+
+        if operation == "MEMBERS":
+            users = store.get_users_of_channel(channel)
+            return {"channel": channel, "users": users}
+
+        if operation == "SEND":
+            message = store.post_message(channel, fields["username"], fields["text"])
+            self.replicate(channel, message.to_dict())
+            return {"message_id": message.get_id(), "channel": channel, "username": fields["username"], "text": fields["text"]}
+        
+
+        if operation == "HISTORY":
+            if fields["limit"] is None:
+                messages = store.get_channel_history(channel)
+            else:
+                messages = store.get_channel_history(channel, fields["limit"])
+            return {"channel": channel, "messages": messages}
+            
+        raise BAD_REQUEST(f"Unknown operation {operation!r}.")
+    
+    def handle_forward(self, msg):
+        request_id = msg.get("request_id")
+        operation  = msg.get("operation")
+        fields     = msg.get("fields", {})
+        try:
+            result = self.do_local_operation(operation, fields)
+            return {"type": "FORWARD_RESPONSE", "request_id": request_id, "status": "ok", "result": result}
+        except ERROR as e:
+            return {"type": "FORWARD_RESPONSE", "request_id": request_id, "status": "error", "code": e.code, "message": e.message}
+
+
+    def forward(self, target_id, operation, fields):
+        with self.state_lock:
+            if not self.alive[target_id]:
+                raise SERVICE_UNAVAILABLE(f"Server {target_id} is unavailable.")
+
+        peer_info  = self.cluster_config["servers"][target_id]
+        request_id = uuid.uuid4().hex
+        print(f"[{self.id}] FORWARD {operation} to {target_id} (request {request_id[:8]})")
+        reply = self.peer_call(peer_info["host"], peer_info["peer_port"], 
+                               {"type": "FORWARD",
+                                "from": self.id,
+                                "request_id": request_id,
+                                "operation": operation,
+                                "fields": fields})
+        if reply.get("type") != "FORWARD_RESPONSE" or reply.get("request_id") != request_id:
+            raise SERVICE_UNAVAILABLE(f"Bad FORWARD_RESPONSE from {target_id}.")
+        if reply.get("status") == "error":
+            error_class = code_lookup(reply.get("code"))
+            raise error_class(reply.get("message"))
+
+        return reply.get("result")
+    
+
+
+    def register_user(self, username):
+        if self.id == self.user_owner:
+            return self.do_local_operation("REGISTER_USER", {"username": username})
+
+        result = self.forward(self.user_owner, "REGISTER_USER", {"username": username})
+
+        self.store.add_user(username)
+        return result
 
     def add_user(self, msg):
-        pass
+        username = msg.get("username")
+        if not isinstance(username, str):
+            raise BAD_REQUEST("USER_ADD needs a 'username'.")
+        self.store.add_user(username)
+        print(f"[{self.id}] USER_ADD from {msg.get('from')}: {username}")
+        return {"type": "USER_ADD_ACK", "from": self.id, "username": username}
+
+    # Replication methods:
+
+    def replicate(self, channel, message):
+        backup = self.backup_of(channel)
+
+        with self.state_lock:
+            backup_alive = self.alive.get(backup, False)
+
+        if not backup_alive:
+            print(f"[{self.id}] Backup {backup} is unavailable; skipped REPLICATE of {channel} #{message['message_id']}")
+            return False
+
+        peer_info = self.cluster_config["servers"][backup]
+        try:
+            reply = self.peer_call(peer_info["host"], peer_info["peer_port"],
+                                   {"type": "REPLICATE", "from": self.id,
+                                    "channel": channel, "message": message})
+        except SERVICE_UNAVAILABLE as e:
+            print(f"[{self.id}] REPLICATE of {channel} #{message['message_id']} to {backup} failed: {e.message}")
+            return False
+
+        acked = reply.get("type") == "REPLICATE_ACK" and reply.get("message_id") == message["message_id"]
+        print(f"[{self.id}] REPLICATE {channel} #{message['message_id']} to {backup}: "
+              f"{'ACK' if acked else 'no valid ACK'}")
+        return acked
+
+    def store_replica(self, msg):
+        store = self.store
+        channel = msg.get("channel")
+        message = msg.get("message")
+
+        if channel not in self.cluster_config["channels"] or not isinstance(message, dict):
+            raise BAD_REQUEST("REPLICATE needs a known 'channel' and a 'message' object.")
+
+        message_id = message.get("message_id")
+        username = message.get("username")
+        text = message.get("text")
+
+        if not isinstance(message_id, int) or not isinstance(username, str) or not isinstance(text, str):
+            raise BAD_REQUEST("REPLICATE message needs a message_id, username, and text field.")
+
+        stored = store.store_replica(channel, message_id, username, text)
+        if stored:
+            print(f"[{self.id}] Stored replica {channel} #{message_id} from {msg.get('from')}")
+        else:
+            print(f"[{self.id}] Duplicate REPLICATE {channel} #{message_id}; already stored")
+
+        return {"type": "REPLICATE_ACK", "from": self.id,
+                "channel": channel, "message_id": message_id}
+
+    def primary_of(self, channel):
+        entry = self.cluster_config["channels"].get(channel)
+        if entry is None:
+            raise NOT_FOUND("Channel does not exist.")
+        return entry["primary"]
+
+    def backup_of(self, channel):
+        entry = self.cluster_config["channels"].get(channel)
+        if entry is None:
+            raise NOT_FOUND("Channel does not exist.")
+        return entry["backup"]
+
+
+    def compute_leader(self):
+        servers = self.cluster_config["servers"]
+        with self.state_lock:
+            # look up the available processes, which is this one and the currently
+            # alive ones
+            available = [self.id] + [server_id for server_id, is_alive in self.alive.items() if is_alive]
+
+            # get the max priority from the available server IDs and then return it
+            return max(available, key=lambda sid: servers[sid]["priority"])
+
+    def recompute_leader(self):
+        new_leader = self.compute_leader()
+        with self.state_lock:
+            old_leader = self.current_leader
+            self.current_leader = new_leader
+
+        if new_leader == old_leader:
+            return
+
+        print(f"[{self.id}] Leader changed from {old_leader} to {new_leader}")
+
+        # If this process is the leader, announce it to the other processes
+        if new_leader == self.id:
+            targets = self.alive_peers()
+            print(f"[{self.id}] Sending LEADER_ANNOUNCE to {targets}")
+            self.broadcast({"type": "LEADER_ANNOUNCE", 
+                            "from": self.id,
+                            "leader": self.id}, targets)
+            
+    def update_leader(self, msg):
+        sender = msg.get("from")
+        leader = msg.get("leader")
+
+        if sender not in self.alive or leader not in self.cluster_config["servers"]:
+            raise BAD_REQUEST("LEADER_ANNOUNCE needs a known 'from' and 'leader' entry.")
+
+        with self.state_lock:
+            # ignore any incoming announcements from a node that is marked as down
+            if not self.alive[sender]:
+                print(f"[{self.id}] Ignored LEADER_ANNOUNCE from {sender} (marked unavailable)")
+                return {"type": "LEADER_ACK", "from": self.id, "accepted": False}
+            self.current_leader = leader
+
+        print(f"[{self.id}] Received LEADER_ANNOUNCE from {sender}: leader is {leader}")
+
+        return {"type": "LEADER_ACK", "from": self.id, "accepted": True}
+
+    # Snapshot for GET /leader
+    def leader_status(self):
+        with self.state_lock:
+            leader = self.current_leader
+            if leader == self.id:
+                alive = True
+            else:
+                alive = self.alive[leader]
+            return {"leader": leader, "alive": alive}
+
+    def route_channel_op(self, operation, channel, fields):
+        if not self.regex_channel.search(channel):
+            raise INVALID_CHANNEL("Invalid channel name.")
+        if channel not in self.cluster_config["channels"]:
+            raise NOT_FOUND("Channel does not exist.")
+
+        fields["channel"] = channel
+
+        primary = self.primary_of(channel)
+
+        if primary == self.id:
+            return self.do_local_operation(operation, fields)
+
+        else:
+            return self.forward(primary, operation, fields)
 
     def get_id(self):
         return self.id
+
 
 
 # Creating a class for a Message object that contains relevant data 
@@ -581,6 +814,11 @@ class SERVICE_UNAVAILABLE(ERROR):
     http_status = 503
     default_message = "Peer process is not detected."
 
+class METHOD_NOT_ALLOWED(ERROR):
+    code = "METHOD_NOT_ALLOWED"
+    http_status = 405
+    default_message = "This method is not supported."
+
 # mapping code to exception class for forwarding messages (5.2) 
 code_to_class = {
     "BAD_REQUEST"         : BAD_REQUEST,
@@ -590,10 +828,12 @@ code_to_class = {
     "INVALID_CHANNEL"     : INVALID_CHANNEL,
     "SERVER_ERROR"        : SERVER_ERROR,
     "NOT_FOUND"           : NOT_FOUND,
-    "SERVICE_UNAVAILABLE" : SERVICE_UNAVAILABLE
+    "SERVICE_UNAVAILABLE" : SERVICE_UNAVAILABLE,
+    "METHOD_NOT_ALLOWED"  : METHOD_NOT_ALLOWED
 }
 
-# creating a method to handle fallback if an invalid code is entered
+
+# creating a method to handle fallback if an invalid code is entered.
 def code_lookup(code):
     try:
         return code_to_class[code]
@@ -673,6 +913,7 @@ class MiniDiscordHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         try:
             store = self.server.store
+            peer = self.server.peer
 
             path = self.path
 
@@ -690,10 +931,13 @@ class MiniDiscordHandler(http.server.BaseHTTPRequestHandler):
             if length == 2:
                 if segments[1] == "health":
                     self._send_json(200, {"status": "ok",
-                                          "server_id": self.server.peer.id})
+                                          "server_id": peer.id})
                 
                 elif segments[1] == "servers":
-                    self._send_json(200, {"servers": self.server.peer.server_status()})
+                    self._send_json(200, {"servers": peer.server_status()})
+
+                elif segments[1] == "leader":
+                    self._send_json(200, peer.leader_status())
 
                 elif segments[1] == "users":
                     self._send_json(200, {"users": store.get_users()})
@@ -708,22 +952,28 @@ class MiniDiscordHandler(http.server.BaseHTTPRequestHandler):
                 if segments[1] == "channels" and segments[3] == "users":
                     # verify last segment of GET query is users
                     channel = segments[2]
-                    self._send_json(200, {"channel": channel, 
-                                          "users" : store.get_users_of_channel(channel)})
+                    result = peer.route_channel_op("MEMBERS", channel, {})
+                    self._send_json(200, result)
+                elif segments[1] == "replica" and segments[3] == "messages":
+                    channel = segments[2]
+                    self._send_json(200, {"channel": channel,
+                                          "messages": store.get_replica(channel)})
+                    
                 elif segments[1] == "channels" and segments[3] == "messages":
                     # get the limit parameter from the query section of path
                     # convert it to an int()
                     channel = segments[2]
                     try:
-                        limit = int(parsed_query["limit"][0])
-                        self._send_json(200, {"channel": channel,
-                                               "messages":store.get_channel_history(channel, limit)})
+                        if "limit" in parsed_query:
+                            limit = int(parsed_query["limit"][0])
+                        else:
+                            limit = None
                     except ValueError:
                         raise BAD_REQUEST("Limit parameter is not found or not an integer.")
+                    result = peer.route_channel_op("HISTORY", channel, {"limit": limit})
+                    self._send_json(200, result)
+                    
 
-                    except KeyError:
-                        self._send_json(200, {"channel": channel,
-                                                                  "messages":store.get_channel_history(channel)})
                         
                 else:
                     raise NOT_FOUND("Unknown path.")
@@ -739,6 +989,7 @@ class MiniDiscordHandler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         try:
             store = self.server.store
+            peer = self.server.peer
 
             path = self.path
 
@@ -759,7 +1010,7 @@ class MiniDiscordHandler(http.server.BaseHTTPRequestHandler):
                     # name should be of type str, this rejects None values as well
                     if not isinstance(name, str):
                         raise BAD_REQUEST("Name is invalid")
-                    store.register_user(name)
+                    peer.register_user(name)
                     self._send_json(201, {"username": name})
                 else:
                     raise NOT_FOUND("Unknown path.")
@@ -768,10 +1019,8 @@ class MiniDiscordHandler(http.server.BaseHTTPRequestHandler):
                 if segments[1] == "channels" and segments[3] == "members":
                     channel = segments[2]
                     username = self.require_user_header()
-                    store.join(username, channel)
-                    self._send_json(200, {"channel": channel,
-                                        "username": username,
-                                        "joined": True})
+                    result = peer.route_channel_op("JOIN", channel, {"username": username})
+                    self._send_json(200, result)
 
                 elif segments[1] == "channels" and segments[3] == "messages":
                     channel = segments[2]
@@ -785,13 +1034,9 @@ class MiniDiscordHandler(http.server.BaseHTTPRequestHandler):
 
                     if text == "":
                         raise BAD_REQUEST("Message is empty.")
-                    
-                    message = store.post_message(channel, username, text)
-                    message_id = message.get_id()
-                    self._send_json(201, {"message_id" : message_id,
-                                          "channel": channel,
-                                          "username": username,
-                                          "text": text})
+
+                    result = peer.route_channel_op("SEND", channel, {"username": username, "text": text})
+                    self._send_json(201, result)
 
                 else:
                     raise NOT_FOUND("Unknown path.")
@@ -806,6 +1051,7 @@ class MiniDiscordHandler(http.server.BaseHTTPRequestHandler):
     def do_DELETE(self):
         try:
             store = self.server.store
+            peer = self.server.peer
             path = self.path
 
             # urlsplit returns separate parts, we are only interested in .path
@@ -821,11 +1067,10 @@ class MiniDiscordHandler(http.server.BaseHTTPRequestHandler):
                 if segments[1] == "channels" and segments[3] == "members":
                     channel = segments[2]
                     username = segments[4]
-                    store.leave(username, channel)
+                    result = peer.route_channel_op("LEAVE", channel, {"username": username})
 
-                    self._send_json(200, {"channel": channel,
-                                        "username": username,
-                                        "left": True})
+                    self._send_json(200, result)
+                
                 else:
                     raise NOT_FOUND("Unknown path.")
             else:
@@ -835,6 +1080,17 @@ class MiniDiscordHandler(http.server.BaseHTTPRequestHandler):
         except Exception:
             traceback.print_exc()
             self._send_json(500, SERVER_ERROR().to_dict())
+
+    def do_PUT(self):
+        self.reject_method()
+
+    def do_PATCH(self):
+        self.reject_method()
+
+    def reject_method(self):
+        parsed_path = urllib.parse.urlsplit(self.path).path
+        error = METHOD_NOT_ALLOWED("Method " + self.command + " is not supported on " + parsed_path)
+        self._send_json(error.http_status, error.to_dict())
     
     # Return None, simply print
     def log_message(self, format, *args):
